@@ -29,6 +29,8 @@ from setuptools.package_index import (
     htmldecode,
     find_external_links,
     PYPI_MD5,
+    URL_SCHEME,
+    distros_for_url,
     )
 
 from pkg_resources import Requirement
@@ -37,12 +39,28 @@ from collective.eggproxy.config import config
 ALWAYS_REFRESH = config.getboolean('eggproxy', 'always_refresh')
 EGGS_DIR = config.get("eggproxy", "eggs_directory")
 INDEX_URL = config.get("eggproxy", "index")
+
 #INDEX is defined *after* the PackageIndex class.
 
 
 class PackageIndex(BasePackageIndex):
     """
     """
+
+    def __init__(self, index_url=["http://pypi.python.org/simple"], hosts=('*',),
+        *args, **kw
+    ):
+        self.index_urls = []
+        if type(index_url) is list:
+            BasePackageIndex.__init__(self, index_url[0], hosts, *args,**kw)
+            for url in index_url:
+                self.index_urls.append (url + "/"[:not url.endswith('/')])
+
+        else:
+            BasePackageIndex.__init__(self, index_url, hosts, *args,**kw)
+            self.index_urls.append(index_url)
+
+
 
     def can_add(self, dist):
         """Overrides PackageIndex.can_add method to remove filter on python
@@ -88,27 +106,31 @@ class PackageIndex(BasePackageIndex):
         """Process the contents of a PyPI page
         Override: don't lowercase package name
         """
+        if ALWAYS_REFRESH:
+            # Zap ourselves from the fetched url list, otherwise we'll
+            # never be updated as long as the server runs.
+            del self.fetched_urls[url]
+
         def scan(link):
             # Process a URL to see if it's for a package page
-            if link.startswith(self.index_url):
-                parts = map(
-                    urllib2.unquote, link[len(self.index_url):].split('/')
-                )
-                if len(parts)==2 and '#' not in parts[1]:
-                    # it's a package page, sanitize and index it
-                    pkg = safe_name(parts[0])
-                    ver = safe_version(parts[1])
-                    # changed "pkg.lower()" to "pkg"
-                    self.package_pages.setdefault(pkg, {})[link] = True
-                    return to_filename(pkg), to_filename(ver)
+            for url_todo in self.index_urls:
+                if link.startswith(url_todo):
+                    parts = map(
+                        urllib2.unquote, link[len(url_todo):].split('/')
+                        )
+                    if len(parts)==2 and '#' not in parts[1]:
+                        # it's a package page, sanitize and index it
+                        pkg = safe_name(parts[0])
+                        ver = safe_version(parts[1])
+                        # changed "pkg.lower()" to "pkg"
+                        self.package_pages.setdefault(pkg, {})[link] = True
+                        return to_filename(pkg), to_filename(ver)
+
             return None, None
 
         # process an index page into the package-page index
         for match in HREF.finditer(page):
-            try:
-                scan( urlparse.urljoin(url, htmldecode(match.group(1))) )
-            except ValueError:
-                pass
+            scan( urlparse.urljoin(url, htmldecode(match.group(1))) )
 
         pkg, ver = scan(url)   # ensure this page is in the page index
         if pkg:
@@ -128,6 +150,83 @@ class PackageIndex(BasePackageIndex):
             )
         else:
             return ""   # no sense double-scanning non-package pages
+
+    def scan_all(self, msg=None, *args):
+        for url in self.index_urls:
+            if url not in self.fetched_urls:
+                if msg: self.warn(msg,*args)
+                self.info(
+                    "Scanning index of all packages (this may take a while)"
+                    )
+                self.scan_url(url)
+
+    def process_url(self, url, retrieve=False):
+        """Evaluate a URL as a possible download, and maybe retrieve it"""
+        if url in self.scanned_urls and not retrieve:
+            return
+        self.scanned_urls[url] = True
+        if not URL_SCHEME(url):
+            self.process_filename(url)
+            return
+        else:
+            dists = list(distros_for_url(url))
+            if dists:
+                if not self.url_ok(url):
+                    return
+                self.debug("Found link: %s", url)
+
+        if dists or not retrieve or url in self.fetched_urls:
+            map(self.add, dists)
+            return  # don't need the actual page
+
+        if not self.url_ok(url):
+            self.fetched_urls[url] = True
+            return
+
+        self.info("Reading %s", url)
+
+        f = self.open_url(url, "Download error on %s: %%s -- Some packages may not be found!" % url)
+        if f is None: return
+        self.fetched_urls[url] = self.fetched_urls[f.url] = True
+
+        if 'html' not in f.headers.get('content-type', '').lower():
+            f.close()   # not html, we can't process it
+            return
+
+        base = f.url     # handle redirects
+        page = f.read()
+        if not isinstance(page, str): # We are in Python 3 and got bytes. We want str.
+            if isinstance(f, urllib2.HTTPError):
+                # Errors have no charset, assume latin1:
+                charset = 'latin-1'
+            else:
+                charset = f.headers.get_param('charset') or 'latin-1'
+            page = page.decode(charset, "ignore")
+        f.close()
+        for match in HREF.finditer(page):
+            link = urlparse.urljoin(base, htmldecode(match.group(1)))
+            self.process_url(link)
+
+        for index_url in self.index_urls:
+            if url.startswith(index_url) and getattr(f,'code',None)!=404:
+                page = self.process_index(url, page)
+
+    def find_packages(self, requirement):
+        for url in self.index_urls:
+            self.scan_url(url + requirement.unsafe_name+'/')
+
+        if not self.package_pages.get(requirement.key):
+            # Fall back to safe version of the name
+            for url in self.index_urls:
+                self.scan_url(url + requirement.project_name+'/')
+
+        if not self.package_pages.get(requirement.key):
+            # We couldn't find the target package, so search the index page too
+            self.not_found_in_index(requirement)
+
+        for url in list(self.package_pages.get(requirement.key,())):
+            # scan each page that might be related to the desired package
+            self.scan_url(url)
 
 
 INDEX = PackageIndex(index_url=INDEX_URL)
@@ -154,8 +253,8 @@ class IndexProxy(object):
         local_package_names = [item for item in os.listdir(eggs_dir)
                 if os.path.isdir(os.path.join(eggs_dir,item))]
         self.index.scan_all()
-        package_names = list(set(self.index.package_pages.keys()).union(
-            set(local_package_names)))
+
+        package_names = self.index.package_pages.keys()
         package_names.sort()
 
         print >> html, "<html><head><title>Simple Index</title></head><body>"
@@ -182,12 +281,12 @@ class IndexProxy(object):
                     local_eggs[pkg] = True
 
         self._lookupPackage(package_name)
-        if not self.index[package_name] and len(local_eggs) == 0:
-            raise PackageNotFound, "Package '%s' does not exists or has no " \
-                    "eggs" % package_name
-
+        if not self.index[package_name]:
+            raise PackageNotFound, "Package '%s' does not exists or has no eggs" % package_name
+        package_path = os.path.join(eggs_dir, package_name)
         if not os.path.exists(package_path):
             os.mkdir(package_path)
+
         html_path = os.path.join(package_path, 'index.html')
         dists = self.index[package_name]
         if not dists and os.path.exists(html_path):

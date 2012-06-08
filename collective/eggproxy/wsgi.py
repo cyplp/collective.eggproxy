@@ -48,7 +48,7 @@ class EggProxyApp(object):
         if not os.path.isdir(eggs_dir):
             print 'You must create the %r directory' % eggs_dir
             sys.exit()
-        self.eggs_index_proxy = IndexProxy(PackageIndex(index_url=index_url))
+        self.eggs_index_proxy = IndexProxy(PackageIndex(index_url=index_url.split()))
         self.eggs_dir = eggs_dir
 
     def __call__(self, environ, start_response):

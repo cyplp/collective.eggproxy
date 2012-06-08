@@ -17,7 +17,7 @@ def test_index():
     page = open(os.path.join(tempdir, 'index.html')).read()
 
     # check case
-    assert 'PasteDeploy' in page
+    assert 'auth' in page
 
 @with_setup(setup_func, teardown_func)
 def test_local_index():
@@ -27,7 +27,8 @@ def test_local_index():
     index.updateBaseIndex(tempdir)
 
     page = open(os.path.join(tempdir, 'index.html')).read()
-    assert '<a href="my.eggproxy.test.package/">my.eggproxy.test.package</a>' in page
+    print page
+    assert '<a href="auth/">auth</a>' in page
 
 @with_setup(setup_func, teardown_func)
 def test_package():
